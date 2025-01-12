@@ -1,4 +1,4 @@
 fastapi==0.104.1
 httpx==0.25.2
-uvicorn==0.24.0
 httpcore==1.0.2
+free-proxy==1.1.1
