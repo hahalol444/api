@@ -40,7 +40,7 @@ async def get_game_servers(game_id: str, cursor: Optional[str] = None):
     
     try:
         print(f"[Fetching] Getting new server data for game {game_id}...")
-        url = f"https://games.roblox.com/v1/games/{game_id}/servers/Public?limit=100&"
+        url = f"https://games.roblox.com/v1/games/{game_id}/servers/Public?limit=100&Cursor="
         if cursor:
             url += cursor
             
