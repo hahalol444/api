@@ -38,11 +38,11 @@ async def get_game_servers(game_id: str, cursor: Optional[str] = None):
         print(f"[Cache Hit] Returning cached data for game {game_id} ({int(10 - (current_time - cache_entry['timestamp']))}s remaining)")
         return cache_entry['data']
     
-    try:
+   try:
         print(f"[Fetching] Getting new server data for game {game_id}...")
-        url = f"https://games.roblox.com/v1/games/{game_id}/servers/Public?limit=100&Cursor="
+        url = f"https://games.roblox.com/v1/games/{game_id}/servers/Public?limit=100"
         if cursor:
-            url += cursor
+            url += f"&cursor={cursor}"
             
         async with get_client() as client:
             response = await client.get(
