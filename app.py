@@ -2,18 +2,131 @@ from fastapi import FastAPI, HTTPException
 import httpx
 from contextlib import asynccontextmanager
 from time import time
-from typing import Optional
+from typing import Optional, List, Dict
 import random
+from fp.fp import FreeProxy
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import logging
 
 app = FastAPI()
 
-server_cache = {}
-rate_limit_timers = {}
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+server_cache: Dict[str, dict] = {}
+rate_limit_timers: Dict[str, float] = {}
+proxy_list: List[str] = []
+last_proxy_refresh = 0
+PROXY_REFRESH_INTERVAL = 300
+MAX_PROXIES = 5
+proxy_performance: Dict[str, dict] = {}
+client_pool: Dict[str, httpx.AsyncClient] = {}
+executor = ThreadPoolExecutor(max_workers=5)
+
+def check_proxy(proxy: str) -> bool:
+    try:
+        with httpx.Client(
+            proxies={"all://": proxy},
+            verify=False,
+            timeout=1.0
+        ) as client:
+            resp = client.get("https://games.roblox.com")
+            return resp.status_code == 200
+    except:
+        return False
+
+async def refresh_proxy_list():
+    global proxy_list, last_proxy_refresh, client_pool
+    current_time = time()
+    
+    if current_time - last_proxy_refresh < PROXY_REFRESH_INTERVAL and len(proxy_list) >= 2:
+        return
+        
+    logger.info("[Proxy] Refreshing proxy list...")
+    
+    try:
+        new_proxies = set()
+        
+        for _ in range(MAX_PROXIES * 1.5):
+            try:
+                proxy = FreeProxy(https=True, timeout=0.5).get()
+                if proxy:
+                    new_proxies.add(proxy)
+                if len(new_proxies) >= MAX_PROXIES:
+                    break
+            except:
+                continue
+        
+        loop = asyncio.get_event_loop()
+        proxy_checks = [
+            loop.run_in_executor(executor, check_proxy, proxy)
+            for proxy in new_proxies
+        ]
+        results = await asyncio.gather(*proxy_checks)
+        
+        working_proxies = [
+            proxy for proxy, is_working in zip(new_proxies, results)
+            if is_working
+        ][:MAX_PROXIES]
+        
+        proxy_list = working_proxies
+        
+        for client in client_pool.values():
+            await client.aclose()
+        
+        client_pool = {
+            proxy: httpx.AsyncClient(
+                transport=httpx.AsyncHTTPTransport(retries=1),
+                proxies={"all://": proxy},
+                verify=False,
+                timeout=3.0,
+                limits=httpx.Limits(max_keepalive_connections=3, max_connections=5)
+            )
+            for proxy in working_proxies
+        }
+        
+        last_proxy_refresh = current_time
+        logger.info(f"[Proxy] Found {len(proxy_list)} working proxies")
+        
+    except Exception as e:
+        logger.error(f"[Proxy] Error refreshing proxies: {str(e)}")
+        if not proxy_list:
+            proxy_list = [""]
 
 @asynccontextmanager
 async def get_client():
-    async with httpx.AsyncClient() as client:
-        yield client
+    await refresh_proxy_list()
+    
+    if not proxy_list or not client_pool:
+        async with httpx.AsyncClient(
+            transport=httpx.AsyncHTTPTransport(retries=1),
+            timeout=3.0,
+            limits=httpx.Limits(max_keepalive_connections=3, max_connections=5)
+        ) as client:
+            yield client
+        return
+    
+    proxy = random.choice(proxy_list)
+    client = client_pool.get(proxy)
+    
+    if client:
+        try:
+            yield client
+        except Exception as e:
+            try:
+                proxy_list.remove(proxy)
+                await client.aclose()
+                del client_pool[proxy]
+            except:
+                pass
+            raise e
+    else:
+        async with httpx.AsyncClient(
+            transport=httpx.AsyncHTTPTransport(retries=1),
+            timeout=3.0
+        ) as client:
+            yield client
 
 async def get_game_servers(game_id: str, cursor: Optional[str] = None):
     headers = {
@@ -30,17 +143,17 @@ async def get_game_servers(game_id: str, cursor: Optional[str] = None):
     
     rate_limit_end = rate_limit_timers.get(game_id, 0)
     if current_time < rate_limit_end:
-        print(f"[Rate Limited] Using cached data for game {game_id} ({int(rate_limit_end - current_time)}s remaining)")
+        logger.info(f"[Rate Limited] Using cached data for game {game_id} ({int(rate_limit_end - current_time)}s remaining)")
         if cache_entry:
             return cache_entry['data']
         raise HTTPException(status_code=429, detail="Rate limited and no cached data available")
     
     if cache_entry and (current_time - cache_entry['timestamp'] < 10):
-        print(f"[Cache Hit] Returning cached data for game {game_id} ({int(10 - (current_time - cache_entry['timestamp']))}s remaining)")
+        logger.info(f"[Cache Hit] Returning cached data for game {game_id} ({int(10 - (current_time - cache_entry['timestamp']))}s remaining)")
         return cache_entry['data']
     
     try:
-        print(f"[Fetching] Getting new server data for game {game_id}...")
+        logger.info(f"[Fetching] Getting new server data for game {game_id}...")
         url = f"https://games.roblox.com/v1/games/{game_id}/servers/Public?limit=100"
         if cursor:
             url += f"&cursor={cursor}"
@@ -49,7 +162,7 @@ async def get_game_servers(game_id: str, cursor: Optional[str] = None):
             response = await client.get(
                 url,
                 headers=headers,
-                timeout=5.0,
+                timeout=3.0,
                 follow_redirects=True
             )
             
@@ -60,17 +173,17 @@ async def get_game_servers(game_id: str, cursor: Optional[str] = None):
                         'data': data,
                         'timestamp': current_time
                     }
-                    print(f"[Success] Found {len(data['data'])} servers for game {game_id}")
+                    logger.info(f"[Success] Found {len(data['data'])} servers for game {game_id}")
                     return data
-                print(f"[Empty] No servers found for game {game_id}")
+                logger.warning(f"[Empty] No servers found for game {game_id}")
                 raise HTTPException(status_code=404, detail="No servers found for this game")
             
             if response.status_code == 404:
-                print(f"[Not Found] Game {game_id} does not exist")
+                logger.warning(f"[Not Found] Game {game_id} does not exist")
                 raise HTTPException(status_code=404, detail="Game not found")
             
             if response.status_code == 429:
-                print(f"[Rate Limited] Using cached data for game {game_id}")
+                logger.warning(f"[Rate Limited] Using cached data for game {game_id}")
                 rate_limit_timers[game_id] = current_time + 5  
                 
                 if cache_entry:
@@ -78,7 +191,7 @@ async def get_game_servers(game_id: str, cursor: Optional[str] = None):
                 raise HTTPException(status_code=429, detail="Rate limited and no cached data available")
                 
     except Exception as e:
-        print(f"[Error] Failed to fetch game {game_id}, using cached data if available")
+        logger.error(f"[Error] Failed to fetch game {game_id}: {str(e)}")
         
         if cache_entry:
             return cache_entry['data']
@@ -86,13 +199,15 @@ async def get_game_servers(game_id: str, cursor: Optional[str] = None):
 
 @app.get("/servers/{game_id_with_cursor:path}")
 async def get_servers(game_id_with_cursor: str):
-    
-    if "eyJ" in game_id_with_cursor:
-        
-        parts = game_id_with_cursor.split("eyJ")
-        game_id = parts[0]
-        cursor = "eyJ" + parts[1]
-    else:
-        game_id = game_id_with_cursor
-        cursor = None
-    return await get_game_servers(game_id, cursor)
+    try:
+        if "eyJ" in game_id_with_cursor:
+            parts = game_id_with_cursor.split("eyJ")
+            game_id = parts[0]
+            cursor = "eyJ" + parts[1]
+        else:
+            game_id = game_id_with_cursor
+            cursor = None
+        return await get_game_servers(game_id, cursor)
+    except Exception as e:
+        logger.error(f"Error processing request: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
